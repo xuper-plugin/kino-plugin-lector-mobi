@@ -11,14 +11,19 @@ const GUTENBERG = "https://www.gutenberg.org";
 const ARCHIVE = "https://archive.org";
 
 /** The shelf: Project Gutenberg public-domain books, by their ebook number. */
-export const BOOKS = [
-  { id: "320", title: "Lazarillo de Tormes", author: "Anónimo", lang: "es" },
-  { id: "11", title: "Alice's Adventures in Wonderland", author: "Lewis Carroll", lang: "en" },
-  { id: "1342", title: "Pride and Prejudice", author: "Jane Austen", lang: "en" },
-];
-
 /** About how many characters one page holds: what fits a TV screen without scrolling, and a phone reads comfortably. */
 export const PAGE_CHARS = 650;
+/** How many characters a page holds at each text size (the bigger the letter, the fewer fit). */
+export const PAGE_LIMITS = [650, 520, 400];
+/** Chapters listed, results of a search in the book and bookmarks kept: never more than these. */
+const MAX_CHAPTERS = 400;
+const MAX_FOUND = 40;
+const MAX_MARKS = 100;
+const MAX_NOTES = 200;
+const NOTE_CHARS = 600;
+const MAX_CATS = 6;
+/** The characters of downloaded text kept in the storage (16 MB, shared); the books read longest ago lose their text first, never their notes. */
+const TEXT_BUDGET = 8_000_000;
 const PAGE_SEP = "\u0002";
 const HEADING = "\u0001";
 /** Whatever the book, never more than this many characters of text are kept (a runaway file cannot fill the storage). */
@@ -277,7 +282,24 @@ const attr = (tag, name) => {
 const dirOf = (path) => (path.includes("/") ? path.slice(0, path.lastIndexOf("/") + 1) : "");
 const decodePath = (s) => { try { return decodeURIComponent(s); } catch { return s; } };
 
-/** An .epub file's bytes to `{ title, html }`: the spine's XHTML files, in reading order, joined. */
+/** The path of an EPUB's cover picture in its package [opf] (base folder [base]), or "". */
+export function epubCoverHref(opf, base) {
+  const items = [];
+  for (const m of opf.match(/<item\b[^>]*>/gi) || []) items.push({ id: attr(m, "id"), href: attr(m, "href"), type: attr(m, "media-type"), props: attr(m, "properties") });
+  const image = (i) => /^image\/(png|jpeg|gif|webp)$/i.test(i.type);
+  const metaCover = attr((/<meta\b[^>]*name\s*=\s*["']cover["'][^>]*>/i.exec(opf) || [""])[0], "content");
+  const it = items.find((i) => image(i) && /\bcover-image\b/.test(i.props)) || items.find((i) => image(i) && metaCover && i.id === metaCover);
+  return it ? base + it.href.split("#")[0] : "";
+}
+
+/** A picture's bytes as a `data:` url Kino's Image takes (png, jpeg, gif or webp by what the first bytes say), or "" when it is none or too big. */
+export function coverDataUrl(b) {
+  if (!b || b.length < 12 || b.length > 140_000) return "";
+  const mime = b[0] === 0x89 && b[1] === 0x50 ? "png" : b[0] === 0xff && b[1] === 0xd8 ? "jpeg" : b[0] === 0x47 && b[1] === 0x49 ? "gif" : b[0] === 0x52 && b[1] === 0x49 && b[8] === 0x57 ? "webp" : "";
+  return mime ? `data:image/${mime};base64,${b64encode(b)}` : "";
+}
+
+/** An .epub file's bytes to `{ title, html, cover }`: the spine's XHTML files, in reading order, joined. */
 export function parseEpub(b) {
   const zip = openZip(b);
   const text = (name) => { const d = zip.read(name); return d ? utf8(d) : ""; };
@@ -291,7 +313,7 @@ export function parseEpub(b) {
   const opf = text(rootPath);
   const base = dirOf(rootPath);
   const items = new Map();
-  for (const m of opf.match(/<item\b[^>]*>/gi) || []) items.set(attr(m, "id"), { href: attr(m, "href"), type: attr(m, "media-type") });
+  for (const m of opf.match(/<item\b[^>]*>/gi) || []) items.set(attr(m, "id"), { href: attr(m, "href"), type: attr(m, "media-type"), props: attr(m, "properties") });
   const titleM = /<dc:title[^>]*>([\s\S]*?)<\/dc:title>/i.exec(opf);
   const title = titleM ? titleM[1].replace(/<[^>]+>/g, "").trim() : "";
   const parts = [];
@@ -307,7 +329,9 @@ export function parseEpub(b) {
     if (size >= MAX_TEXT) break;
   }
   if (parts.length === 0) throw new Error("El EPUB no tiene capítulos de texto");
-  return { title, html: parts.join("\n") };
+  let cover = null;
+  try { const href = epubCoverHref(opf, base); if (href) cover = zip.read(href) || zip.read(base + decodePath(href.slice(base.length))); } catch { /* a book without a readable cover */ }
+  return { title, html: parts.join("\n"), cover };
 }
 
 // ---------------------------------------------------------------- the MOBI format
@@ -412,11 +436,12 @@ export function parseBook(b) {
 const ENTITIES = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " ", hellip: "…", mdash: "—", ndash: "–", lsquo: "‘", rsquo: "’", ldquo: "“", rdquo: "”", laquo: "«", raquo: "»" };
 
 /** The book's HTML as paragraphs; a heading is a paragraph that starts with U+0001. */
-export function paragraphs(html) {
+export function rawLines(html) {
   let s = html.replace(/<head[\s\S]*?<\/head>/gi, "").replace(/<(script|style)[\s\S]*?<\/\1>/gi, "");
   // The file's own line breaks are only its source wrapping (an EPUB is cut at 80 columns): paragraphs come from the tags.
   s = s.replace(/\s+/g, " ");
-  s = s.replace(/<h[1-3][^>]*>/gi, "\n" + HEADING).replace(/<\/h[1-6]>/gi, "\n");
+  // A heading is one line: the line breaks inside it (a title split by <br/>) are spaces.
+  s = s.replace(/<h([1-3])[^>]*>([\s\S]*?)<\/h\1>/gi, (m, n, inner) => "\n" + HEADING + inner.replace(/<br\s*\/?>/gi, " ") + "\n").replace(/<\/h[1-6]>/gi, "\n");
   s = s.replace(/<\/(p|div|li|tr|blockquote)>|<br\s*\/?>|<mbp:pagebreak\s*\/?>|<p\b[^>]*>/gi, "\n");
   s = s.replace(/<[^>]+>/g, "");
   s = s.replace(/&(#x?[0-9a-f]+|[a-z]+);/gi, (m, e) => {
@@ -426,40 +451,66 @@ export function paragraphs(html) {
     }
     return Object.hasOwn(ENTITIES, e.toLowerCase()) ? ENTITIES[e.toLowerCase()] : m;
   });
-  const lines = s.split("\n").map((l) => l.replace(/\s+/g, " ").trim()).filter((l) => l.length > 0 && l !== HEADING);
+  return s.split("\n").map((l) => l.replace(/\s+/g, " ").trim()).filter((l) => l.length > 0 && l !== HEADING);
+}
+
+/** The whole book's lines as its paragraphs: the licence cut off, and the lines that are chapter titles marked. */
+export function finishLines(lines) {
   // A Project Gutenberg file wraps the book in a licence: start at the book, end with it.
   const first = lines.findIndex((l) => l.includes("*** START OF"));
   const last = lines.findIndex((l) => l.includes("*** END OF"));
   const from = first >= 0 ? first + 1 : 0;
   const to = last > from ? last : lines.length;
-  return lines.slice(from, to);
+  // A file with no heading tags (a Kindle one) still has lines like "CHAPTER IV." or "Libro primero": they are headings too.
+  return lines.slice(from, to).map((l) => (l[0] !== HEADING && isHeadingLine(l) ? HEADING + l : l));
+}
+
+/** A book's HTML as its paragraphs (a heading starts with U+0001), in one go. */
+export function paragraphs(html) {
+  return finishLines(rawLines(html));
+}
+
+const NUMBER = "(?:[ivxlcdm]{1,8}|\\d{1,3}|uno|dos|tres|cuatro|cinco|seis|siete|ocho|nueve|diez|primero|primera|segundo|segunda|tercero|tercera|cuarto|quinto|sexto|one|two|three|four|five|six|seven|eight|nine|ten|first|second|third|fourth|fifth)";
+const HEADING_WORDS = new RegExp("^(?:(?:chapter|cap[ií]tulo|libro|book|parte|part|canto|acto|act|tratado|treatise|section|secci[óo]n)\\s+" + NUMBER + "\\b[.:]?(?:\\s.{0,60})?|pr[óo]logo|prologue|ep[ií]logo|epilogue|prefacio|preface|introducci[óo]n|introduction)$", "i");
+
+/** Whether a short line is a chapter title: "Chapter 3", "LIBRO PRIMERO", "Prólogo", or only a Roman numeral ("XVI."). */
+export function isHeadingLine(l) {
+  return l.length <= 80 && (HEADING_WORDS.test(l) || /^[IVXLCDM]{1,8}\.$/.test(l));
 }
 
 /** Paragraphs cut into pages of about [limit] characters; a long paragraph is cut at a sentence end. Each page is a string; paragraphs are split by a blank line. */
 export function paginate(paras, limit = PAGE_CHARS) {
+  return paginateIdx(paras, limit).pages;
+}
+
+/** The pages of [paras] (each is its pieces joined by a blank line) and, for each, the index of the paragraph it starts at. */
+export function paginateIdx(paras, limit = PAGE_CHARS) {
   const pieces = [];
-  for (const p of paras) {
-    if (p.length <= limit || p[0] === HEADING) { pieces.push(p); continue; }
+  paras.forEach((p, idx) => {
+    if (p.length <= limit || p[0] === HEADING) { pieces.push({ t: p, at: idx }); return; }
     let rest = p;
     while (rest.length > limit) {
       let cut = rest.lastIndexOf(". ", limit);
       if (cut < limit / 3) cut = rest.lastIndexOf(" ", limit);
       if (cut < limit / 3) cut = limit;
-      pieces.push(rest.slice(0, cut + 1).trim());
+      pieces.push({ t: rest.slice(0, cut + 1).trim(), at: idx });
       rest = rest.slice(cut + 1).trim();
     }
-    if (rest) pieces.push(rest);
-  }
+    if (rest) pieces.push({ t: rest, at: idx });
+  });
   const pages = [];
+  const starts = [];
   let cur = [];
   let len = 0;
-  for (const p of pieces) {
-    if (len > 0 && len + p.length > limit) { pages.push(cur.join("\n\n")); cur = []; len = 0; }
-    cur.push(p);
-    len += p.length;
+  let from = 0;
+  for (const piece of pieces) {
+    if (len > 0 && len + piece.t.length > limit) { pages.push(cur.join("\n\n")); starts.push(from); cur = []; len = 0; }
+    if (cur.length === 0) from = piece.at;
+    cur.push(piece.t);
+    len += piece.t.length;
   }
-  if (cur.length) pages.push(cur.join("\n\n"));
-  return pages;
+  if (cur.length) { pages.push(cur.join("\n\n")); starts.push(from); }
+  return { pages, starts };
 }
 
 // ---------------------------------------------------------------- where books come from
@@ -502,8 +553,11 @@ export const RANGED_MIN = 3_000_000;
 
 /** The bytes of book [key] ("gb:<number>" or "ia:<identifier>"). */
 async function download(key) {
+  if (key.startsWith("lf:")) return readLocal(key.slice(3));
   if (key.startsWith("gb:")) {
-    const res = await kino.fetch(`${GUTENBERG}/ebooks/${encodeURIComponent(key.slice(3))}.kindle.noimages`, { timeoutMs: 30000 });
+    const id = encodeURIComponent(key.slice(3));
+    let res = await kino.fetch(`${GUTENBERG}/ebooks/${id}.kindle.noimages`, { timeoutMs: 30000 });
+    if (!res.ok) res = await kino.fetch(`${GUTENBERG}/ebooks/${id}.epub.noimages`, { timeoutMs: 30000 });
     if (!res.ok) throw new Error(`No se pudo descargar el libro (${res.status})`);
     return b64decode(res.base64());
   }
@@ -517,8 +571,27 @@ async function download(key) {
   return downloadPieces(url, key);
 }
 
+/** A book that is a file on the device: read by ranges through kino.files, no network at all. A big EPUB is read by parts like a web one. */
+async function readLocal(id) {
+  const info = await kino.files.info(id);
+  const name = info.name.toLowerCase();
+  const read = async (range) => {
+    let a;
+    let b;
+    if (range[0] === "-") { a = Math.max(0, info.size - Number(range.slice(1))); b = info.size; }
+    else { const [x, y] = range.split("-").map(Number); a = x; b = Math.min(y + 1, info.size); }
+    return { bytes: await kino.files.read(id, { start: a, end: b }), total: info.size };
+  };
+  if (name.endsWith(".epub") && info.size > RANGED_MIN) return downloadEpubParts({ read }, "lf:" + id);
+  if (info.size > MAX_FILE) throw new Error(`El libro pesa ${(info.size / 1e6).toFixed(1)} MB: es demasiado grande para este lector (máximo ${(MAX_FILE / 1e6).toFixed(0)} MB)`);
+  const all = new Uint8Array(info.size);
+  for (let at = 0; at < info.size; at += 1_900_000) all.set(await kino.files.read(id, { start: at, end: Math.min(info.size, at + 1_900_000) }), at);
+  return all;
+}
+
 /** One Range request: the bytes and the whole file's size. [range] is "a-b" or "-n" (the last n bytes). */
 async function rangeBytes(url, range) {
+  if (url !== null && typeof url === "object") return url.read(range); // a file of the device (kino.files), not an address
   const res = await kino.fetch(url, { headers: { Range: `bytes=${range}` }, timeoutMs: 30000 });
   if (res.status === 401 || res.status === 403) throw new Error(LOANED);
   if (res.status !== 206) throw new Error(res.status === 200 ? "archive.org no deja leer este libro por partes" : `No se pudo descargar el libro (${res.status})`);
@@ -760,8 +833,12 @@ async function downloadEpubParts(url, key) {
     if (size >= MAX_TEXT) break;
   }
   await fetchMissing(spine);
+  const opfText = recordText(await record(rootPath), zip.get(rootPath));
+  const coverName = epubCoverHref(opfText, dirOf(rootPath));
+  const cover = coverName && zip.has(coverName) && zip.get(coverName).csize <= 140_000 && zip.get(coverName).usize <= 140_000 ? [coverName] : [];
+  await fetchMissing(cover);
 
-  const names = [...first, rootPath, ...spine];
+  const names = [...first, rootPath, ...spine, ...cover];
   const list = [];
   for (const n of names) list.push({ raw: zip.get(n).raw, rec: await record(n) });
   const out = buildZip(list);
@@ -773,98 +850,469 @@ async function downloadEpubParts(url, key) {
 
 // ---------------------------------------------------------------- the library (download, keep, read)
 
-const bookKey = (key) => "book3:" + key;
-const posKey = (key) => "pos:" + key;
-const SHELF = "shelf3";
-
-async function shelf() {
-  try { const s = JSON.parse((await kino.storage.get(SHELF)) || "[]"); return Array.isArray(s) ? s.filter((x) => x && x.id && x.title) : []; } catch { return []; }
-}
-
-/** The pages of book [key], from the storage or downloaded and read now. */
-async function pagesOf(key, title) {
-  const kept = await kino.storage.get(bookKey(key));
-  if (typeof kept === "string" && kept.length > 0) return kept.split(PAGE_SEP);
-  const { html } = parseBook(await download(key));
-  const pages = paginate(paragraphs(html));
-  if (pages.length === 0) throw new Error("El libro no tiene texto");
-  await kino.storage.set(bookKey(key), pages.join(PAGE_SEP));
-  if (key.startsWith("ia:")) {
-    const rest = (await shelf()).filter((x) => x.id !== key.slice(3));
-    rest.unshift({ id: key.slice(3), title: title || key.slice(3) });
-    for (const old of rest.splice(MAX_SHELF)) { await kino.storage.remove(bookKey("ia:" + old.id)); await kino.storage.remove(posKey("ia:" + old.id)); }
-    await kino.storage.set(SHELF, JSON.stringify(rest));
-  }
-  return pages;
-}
+/** `{ [bookKey]: { title, n, sz, fav, cat, last, cached } }`: every book the person has opened, kept for good (small). */
+const LIB = "lib4";
+const CATS = "cats4";
+const parasKey = (key) => "paras4:" + key;
+const posKey = (key) => "pos4:" + key;
+const bmKey = (key) => "bm4:" + key;
+const noteKey = (key) => "nt4:" + key;
+const coverKey = (key) => "cover:" + key;
+const BOOK_KEY = /^(gb:\d{1,8}|ia:[A-Za-z0-9][A-Za-z0-9._-]{0,100}|lf:[A-Za-z0-9]{1,64})$/;
+const DEFAULT_CATS = ["Novela", "Ensayo", "Poesía", "Infantil"];
 
 const clamp = (n, lo, hi) => Math.max(lo, Math.min(hi, n));
-const message = (e) => String(e && e.message ? e.message : e);
+const message = (e) => (e && e.message ? String(e.message) : e && e.code ? `Error: ${e.code}` : "No se pudo abrir el libro");
+
+/** What the reader keeps in memory about the book on show, so a page turn does not read the storage again. */
+const EMPTY_LIVE = { key: "", paras: null, size: 0, fs: -1, pages: null, starts: null };
+let live = EMPTY_LIVE;
+
+/** A storage value holds at most 2 MB: the text of a long book is kept in pieces of this many characters. */
+const CHUNK_CHARS = 700_000;
+
+async function readParas(key) {
+  const n = Number(await kino.storage.get(parasKey(key)));
+  if (!Number.isInteger(n) || n < 1) return null;
+  const parts = [];
+  for (let i = 0; i < n; i++) {
+    const c = await kino.storage.get(`${parasKey(key)}:${i}`);
+    if (typeof c !== "string") return null;
+    parts.push(c);
+  }
+  return parts.join("");
+}
+
+async function removeParas(key) {
+  const n = Number(await kino.storage.get(parasKey(key)));
+  for (let i = 0; i < (Number.isInteger(n) ? n : 0); i++) await kino.storage.remove(`${parasKey(key)}:${i}`);
+  await kino.storage.remove(parasKey(key));
+}
+
+async function writeParas(key, text) {
+  await removeParas(key);
+  const n = Math.ceil(text.length / CHUNK_CHARS);
+  try {
+    for (let i = 0; i < n; i++) await kino.storage.set(`${parasKey(key)}:${i}`, text.slice(i * CHUNK_CHARS, (i + 1) * CHUNK_CHARS));
+    await kino.storage.set(parasKey(key), String(n));
+  } catch (e) {
+    for (let i = 0; i < n; i++) await kino.storage.remove(`${parasKey(key)}:${i}`);
+    throw new Error("No cabe en el almacenamiento del plugin: borra algún libro de tu biblioteca");
+  }
+}
+
+async function libraryMap() {
+  try {
+    const m = JSON.parse((await kino.storage.get(LIB)) || "{}");
+    const out = {};
+    if (m && typeof m === "object") for (const [k, v] of Object.entries(m)) if (BOOK_KEY.test(k) && v && v.title) out[k] = v;
+    return out;
+  } catch { return {}; }
+}
+
+const saveLibrary = (m) => kino.storage.set(LIB, JSON.stringify(m));
+
+/** The library, the last book read first: `{ key, title, n, fav, cat, cached, last }`. */
+async function shelf() {
+  return Object.entries(await libraryMap()).map(([key, v]) => ({ key, ...v })).sort((a, b) => (b.last || 0) - (a.last || 0));
+}
+
+async function categories() {
+  try {
+    const c = JSON.parse((await kino.storage.get(CATS)) || "null");
+    if (Array.isArray(c)) return c.filter((x) => typeof x === "string" && x).slice(0, MAX_CATS);
+  } catch { /* the defaults */ }
+  return DEFAULT_CATS;
+}
+
+/** Drops a book from the library, with its text, place, bookmarks, notes and cover. */
+async function forget(key) {
+  await removeParas(key);
+  for (const k of [posKey(key), bmKey(key), noteKey(key), coverKey(key)]) await kino.storage.remove(k);
+  const m = await libraryMap();
+  delete m[key];
+  await saveLibrary(m);
+  if (live.key === key) live = EMPTY_LIVE;
+}
+
+/** Only the downloaded text goes (the book stays in the library with its notes and place, and downloads again when opened). */
+async function dropText(key) {
+  await removeParas(key);
+  const m = await libraryMap();
+  if (m[key]) { m[key].cached = false; m[key].sz = 0; await saveLibrary(m); }
+  if (live.key === key) live = EMPTY_LIVE;
+}
+
+/**
+ * The book is open now: it goes first in the library (added if new), keeps its favourite mark and category, and when the texts
+ * kept pass [TEXT_BUDGET] characters the ones read longest ago are dropped (never this one).
+ */
+async function touchLibrary(key, title, n, size) {
+  const m = await libraryMap();
+  const old = m[key] || {};
+  m[key] = { title: title || old.title || key, n, sz: size, fav: !!old.fav, cat: old.cat || "", last: Date.now(), cached: true };
+  const byAge = Object.entries(m).filter(([k, v]) => k !== key && v.cached).sort((a, b) => (a[1].last || 0) - (b[1].last || 0));
+  let total = Object.values(m).reduce((t, v) => t + (v.cached ? v.sz || 0 : 0), 0);
+  for (const [k, v] of byAge) {
+    if (total <= TEXT_BUDGET) break;
+    await removeParas(k);
+    total -= v.sz || 0;
+    m[k] = { ...v, cached: false, sz: 0 };
+  }
+  await saveLibrary(m);
+}
+
+async function patchBook(key, patch) {
+  const m = await libraryMap();
+  if (!m[key]) return false;
+  m[key] = { ...m[key], ...patch };
+  await saveLibrary(m);
+  return true;
+}
+
+/** The paragraphs of book [key], from the storage or downloaded and read now (a heading starts with U+0001). */
+async function parasOf(key) {
+  if (live.key === key && live.paras) return { paras: live.paras, size: live.size };
+  const kept = await readParas(key);
+  if (typeof kept !== "string" || kept.length === 0) return null;
+  const paras = kept.split("\n");
+  live = { key, paras, size: kept.length, fs: -1, pages: null, starts: null };
+  return { paras, size: kept.length };
+}
+
+/** The book's text, for a screen that shows it: kept already, or a friendly error (the person opens it again from the library). */
+async function parasNow(key) {
+  const got = await parasOf(key);
+  if (!got) throw new Error("El texto de este libro ya no está guardado: ábrelo otra vez desde tu biblioteca");
+  return got;
+}
+
+const SLICE_CHARS = 150_000;
+/** One step of getting a book ready takes about this long at most (an event call may last 20 s, and a phone is slow). */
+const STEP_MS = 7_000;
+const prepKey = (key) => "prep4:" + key;
+const htmlKey = (key, i) => `html4:${key}:${i}`;
+const rawKey = (key, i) => `raw4:${key}:${i}`;
+
+/** Cuts [html] into pieces of about [size] characters, each ending at the end of a paragraph, division or break where one is near. */
+export function sliceHtml(html, size = SLICE_CHARS) {
+  const out = [];
+  let at = 0;
+  while (at < html.length) {
+    let end = Math.min(html.length, at + size);
+    if (end < html.length) {
+      let cut = -1;
+      for (const t of ["</p>", "</div>", "<br/>", "<br>", "<br />"]) {
+        const k = html.indexOf(t, end);
+        if (k >= 0 && k - end < 20_000 && (cut < 0 || k + t.length < cut)) cut = k + t.length;
+      }
+      if (cut < 0) { const m = html.indexOf(">", end); cut = m >= 0 ? m + 1 : html.length; }
+      end = cut;
+    }
+    out.push(html.slice(at, end));
+    at = end;
+  }
+  return out;
+}
+
+async function prepClear(key) {
+  let meta = null;
+  try { meta = JSON.parse((await kino.storage.get(prepKey(key))) || "null"); } catch { /* none */ }
+  for (let i = 0; i < (meta ? meta.n : 0); i++) { await kino.storage.remove(htmlKey(key, i)); await kino.storage.remove(rawKey(key, i)); }
+  await kino.storage.remove(prepKey(key));
+}
+
+/**
+ * One step of getting book [key] ready to read. Returns `{ paras, size }` when it is, else `{ pct }` and the next step goes on
+ * from what was kept: first the download and the file's reading (cut into pieces of HTML), then each piece into its paragraphs
+ * (a few per step), then the pieces joined, the licence cut off and the text kept. Throws an Error with `partial` while the
+ * download itself is not finished.
+ */
+async function prepare(key) {
+  const started = Date.now();
+  let meta = null;
+  try { meta = JSON.parse((await kino.storage.get(prepKey(key))) || "null"); } catch { /* a fresh start */ }
+  if (!meta) {
+    const { html, cover } = parseBook(await download(key));
+    const slices = sliceHtml(html);
+    for (let i = 0; i < slices.length; i++) await kino.storage.set(htmlKey(key, i), slices[i]);
+    const coverUrl = coverDataUrl(cover);
+    if (coverUrl) await kino.storage.set(coverKey(key), coverUrl);
+    meta = { n: slices.length, i: 0 };
+    await kino.storage.set(prepKey(key), JSON.stringify(meta));
+    return { pct: 0 };
+  }
+  while (meta.i < meta.n && Date.now() - started < STEP_MS) {
+    const html = (await kino.storage.get(htmlKey(key, meta.i))) || "";
+    await kino.storage.set(rawKey(key, meta.i), rawLines(html).join("\n"));
+    await kino.storage.remove(htmlKey(key, meta.i));
+    meta.i++;
+    await kino.storage.set(prepKey(key), JSON.stringify(meta));
+  }
+  if (meta.i < meta.n) return { pct: Math.round((meta.i / meta.n) * 100) };
+  const lines = [];
+  for (let i = 0; i < meta.n; i++) for (const l of ((await kino.storage.get(rawKey(key, i))) || "").split("\n")) if (l) lines.push(l);
+  const paras = finishLines(lines);
+  if (paras.length === 0) { await prepClear(key); throw new Error("El libro no tiene texto"); }
+  const joined = paras.join("\n");
+  await writeParas(key, joined);
+  await prepClear(key);
+  live = { key, paras, size: joined.length, fs: -1, pages: null, starts: null };
+  return { paras, size: joined.length };
+}
+
+/** The pages of the book on show at text size [fs] (a page holds fewer characters at a bigger size), and where each starts. */
+function pagesFor(paras, fs) {
+  if (live.paras === paras && live.fs === fs && live.pages) return live;
+  const { pages, starts } = paginateIdx(paras, PAGE_LIMITS[fs]);
+  live = { ...live, fs, pages, starts };
+  return live;
+}
+
+/** The index of the page that holds paragraph [p]. */
+export function pageOf(starts, p) {
+  let lo = 0;
+  let hi = starts.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1;
+    if (starts[mid] <= p) lo = mid; else hi = mid - 1;
+  }
+  return lo;
+}
+
+/**
+ * The headings of the book, as chapters: `{ t, p }` (title, paragraph). A run of five or more headings with hardly any text
+ * between them whose titles come back later is a table of contents, and is left out (the chapters themselves are what is listed).
+ */
+export function chaptersOf(paras) {
+  const all = [];
+  for (let i = 0; i < paras.length; i++) {
+    if (paras[i][0] !== HEADING) continue;
+    const t = paras[i].slice(1).replace(/\s+/g, " ").trim().slice(0, 80);
+    if (t && (all.length === 0 || all[all.length - 1].t !== t)) all.push({ t, p: i });
+  }
+  const out = [];
+  let i = 0;
+  while (i < all.length) {
+    let j = i;
+    while (j + 1 < all.length && all[j + 1].p - all[j].p <= 2) j++;
+    const run = all.slice(i, j + 1);
+    const later = new Set(all.slice(j + 1).map((c) => c.t));
+    const isToc = run.length >= 5 && run.filter((c) => later.has(c.t)).length * 2 >= run.length;
+    if (!isToc) out.push(...run);
+    i = j + 1;
+  }
+  return out.slice(0, MAX_CHAPTERS);
+}
+
+const plain = (s) => s.replace(/[áàäâ]/g, "a").replace(/[éèëê]/g, "e").replace(/[íìïî]/g, "i").replace(/[óòöô]/g, "o").replace(/[úùüû]/g, "u").replace(/ñ/g, "n");
+
+/** Where [query] is in the book (case and accents aside): up to [MAX_FOUND] `{ p, t }` with a bit of the text around it. */
+export function findInBook(paras, query) {
+  const q = plain(String(query).toLowerCase().trim());
+  if (q.length < 3) return [];
+  const out = [];
+  for (let i = 0; i < paras.length && out.length < MAX_FOUND; i++) {
+    const text = paras[i][0] === HEADING ? paras[i].slice(1) : paras[i];
+    const at = plain(text.toLowerCase()).indexOf(q);
+    if (at < 0) continue;
+    const from = Math.max(0, at - 30);
+    out.push({ p: i, t: (from > 0 ? "…" : "") + text.slice(from, from + 90) });
+  }
+  return out;
+}
+
+/** A list the person keeps for a book (bookmarks or notes), from the storage: `{ p, t }` sorted by place. */
+async function listOf(key, storageKey) {
+  try {
+    const m = JSON.parse((await kino.storage.get(storageKey(key))) || "[]");
+    return Array.isArray(m) ? m.filter((x) => x && Number.isInteger(x.p)).sort((a, b) => a.p - b.p) : [];
+  } catch { return []; }
+}
+const marksOf = (key) => listOf(key, bmKey);
+const notesOf = (key) => listOf(key, noteKey);
+
+async function placeOf(key) {
+  const p = Number(await kino.storage.get(posKey(key)));
+  return Number.isInteger(p) && p > 0 ? p : 0;
+}
+
+// ---------------------------------------------------------------- Project Gutenberg's catalogue (Gutendex)
+
+const GUTENDEX = "https://gutendex.com/books/";
+const LANGS = { es: "español", en: "inglés", fr: "francés", de: "alemán", pt: "portugués", it: "italiano", la: "latín" };
+
+export function gutendexUrl(q, lang, page) {
+  const parts = [];
+  const clean = String(q || "").replace(/\s+/g, " ").trim().slice(0, 100);
+  if (clean) parts.push("search=" + encodeURIComponent(clean));
+  if (lang && lang !== "all") parts.push("languages=" + encodeURIComponent(lang));
+  parts.push("page=" + (page | 0 || 1));
+  return GUTENDEX + "?" + parts.join("&");
+}
+
+/** Gutendex's answer to `{ items: { id, title, author, lang }[], more }`: only books with a Kindle or EPUB file. */
+export function gutendexItems(json) {
+  const list = json && Array.isArray(json.results) ? json.results : [];
+  const items = [];
+  for (const r of list) {
+    const f = r && r.formats ? r.formats : {};
+    if (!Number.isInteger(r.id) || !r.title || !(f["application/x-mobipocket-ebook"] || f["application/epub+zip"])) continue;
+    const name = r.authors && r.authors[0] && r.authors[0].name ? String(r.authors[0].name) : "";
+    const author = name.includes(", ") ? name.split(", ").slice(1).join(" ") + " " + name.split(", ")[0] : name;
+    items.push({ id: String(r.id), title: String(r.title).slice(0, 120), author: author.slice(0, 60), lang: r.languages && r.languages[0] ? String(r.languages[0]) : "" });
+  }
+  return { items, more: !!(json && json.next) };
+}
+
+async function gutenberg(q, lang, page) {
+  const res = await kino.fetch(gutendexUrl(q, lang, page), { timeoutMs: 40000 });
+  if (!res.ok) throw new Error(`El catálogo de Gutenberg no respondió (${res.status}). Prueba otra vez en un momento.`);
+  return gutendexItems(res.json());
+}
 
 // ---------------------------------------------------------------- the screen
 
-const TABS = ["gutenberg", "archive", "mine"];
-const busy = (v) => [{ show: "loading" + v }, { hide: "content" + v }];
+const TABS = ["gutenberg", "archive", "files", "mine"];
+/** Whether this Kino has `kino.files` (0.9.82 and later): the tab of files on the device only shows where it can work. */
+const hasFiles = () => typeof kino === "object" && kino !== null && typeof kino.files === "object" && kino.files !== null;
+const TOC_TABS = ["chapters", "marks", "notes", "find"];
+const BUSY = (v) => [{ show: "loading" + v }, { hide: "content" + v }];
+const SIZES = ["p", "h4", "h3"];
+const fontOf = (s) => clamp(Number.isInteger(s.fs) ? s.fs : 0, 0, SIZES.length - 1);
 
-const cover = (arg, icon) => ({
-  type: "Image", key: "cv" + arg, width: 48, aspect: "2:3", fit: "cover", alt: "Portada", altEn: "Cover",
-  url: /^\d+$/.test(arg) ? `${GUTENBERG}/cache/epub/${arg}/pg${arg}.cover.medium.jpg` : `${ARCHIVE}/services/img/${encodeURIComponent(arg)}`,
+const cover = (key, icon, own) => ({
+  type: "Image", key: "cv" + key, width: 48, aspect: "2:3", fit: "cover", alt: "Portada", altEn: "Cover",
+  url: own || (key.startsWith("gb:") ? `${GUTENBERG}/cache/epub/${key.slice(3)}/pg${key.slice(3)}.cover.medium.jpg` : key.startsWith("ia:") ? `${ARCHIVE}/services/img/${encodeURIComponent(key.slice(3))}` : undefined),
   fallback: { type: "Icon", name: icon },
 });
 
-const tile = (v, key, title, subtitle, icon, onTap, arg) => ({
-  type: "ListTile", key, title, titleEn: title, subtitle: subtitle || undefined, subtitleEn: subtitle || undefined,
-  leading: cover(arg, icon), onTap: { ui: busy(v), event: onTap, arg },
-});
+/** One book of a list: its cover, title and a line under it; a tap opens it, a long press (with [press]) opens the book's menu. */
+function tile(s, key, title, subtitle, press) {
+  const v = s.v | 0;
+  return {
+    type: "ListTile", key: "t:" + key, title, titleEn: title, subtitle: subtitle || undefined, subtitleEn: subtitle || undefined,
+    leading: cover(key, "bookmark", s.covers && s.covers[key]),
+    onTap: { ui: BUSY(v), event: "openBook", arg: key },
+    ...(press ? { onLongPress: { event: press === true ? "bookMenu" : press, arg: key } } : {}),
+  };
+}
 
 const skeleton = (v) => ({
   type: "Column", key: "loading" + v, hidden: true, padding: 16, gap: 12,
   children: [0, 1, 2].map((i) => ({ type: "Skeleton", key: "sk" + i, shape: "line", lines: 2 })),
 });
 
+const empty = (key, icon, title, titleEn, text, textEn) => ({ type: "emptyState", key, icon, title, titleEn, text, textEn });
+
 function gutenbergTab(s) {
-  return BOOKS.map((b) => tile(s.v | 0, "gb" + b.id, b.title, `${b.author} · ${b.lang === "es" ? "español" : "inglés"}`,
-    s.pos && s.pos["gb:" + b.id] ? "check" : "bookmark", "openGb", b.id));
+  const v = s.v | 0;
+  const g = s.gb || { q: "", lang: "es", items: null, more: false };
+  const search = {
+    type: "Column", key: "gbBox", padding: 16, gap: 8,
+    children: [
+      {
+        type: "TextField", key: "gq", kind: "search", labelText: "Buscar en Project Gutenberg", labelTextEn: "Search Project Gutenberg",
+        hintText: "Título o autor", hintTextEn: "Title or author", value: g.q || "",
+        onSubmitted: { ui: BUSY(v), event: "gbSearch" }, trailingIcon: "search", trailingLabel: "Buscar", trailingLabelEn: "Search", onTrailingTap: { ui: BUSY(v), event: "gbSearch" },
+      },
+      {
+        type: "Chips", key: "gl", value: g.lang || "es", onChanged: { ui: BUSY(v), event: "gbLang" },
+        options: [{ value: "es", label: "Español", labelEn: "Spanish" }, { value: "en", label: "Inglés", labelEn: "English" }, { value: "all", label: "Todos", labelEn: "All" }],
+      },
+    ],
+  };
+  if (g.items === null) return [search, empty("gbhint", "search", "Buscando libros…", "Finding books…", "El catálogo de Project Gutenberg tiene más de 70 000 libros libres.", "Project Gutenberg has over 70,000 free books.")];
+  if (g.items.length === 0) return [search, empty("gbnone", "search", "Sin resultados", "No results", "Prueba con otra palabra o con «Todos» los idiomas.", "Try another word or «All» languages.")];
+  return [
+    search,
+    ...g.items.map((b) => tile(s, "gb:" + b.id, b.title, [b.author, LANGS[b.lang] || b.lang].filter(Boolean).join(" · "))),
+    ...(g.more ? [{ type: "Column", key: "gbMore", padding: 16, children: [{ type: "button", key: "gbMoreBtn", label: "Más libros", labelEn: "More books", variant: "secondary", onTap: { ui: BUSY(v), event: "gbMore" } }] }] : []),
+  ];
 }
 
 function archiveTab(s) {
+  const v = s.v | 0;
   const results = Array.isArray(s.results) ? s.results : null;
   return [
     {
       type: "Column", key: "searchBox", padding: 16,
       children: [{
         type: "TextField", key: "q", kind: "search", labelText: "Buscar en archive.org", labelTextEn: "Search archive.org",
-        hintText: "Título o autor", hintTextEn: "Title or author", onSubmitted: { ui: busy(s.v | 0), event: "search" },
-        trailingIcon: "search", trailingLabel: "Buscar", trailingLabelEn: "Search", onTrailingTap: { ui: busy(s.v | 0), event: "search" },
+        hintText: "Título o autor", hintTextEn: "Title or author", onSubmitted: { ui: BUSY(v), event: "search" },
+        trailingIcon: "search", trailingLabel: "Buscar", trailingLabelEn: "Search", onTrailingTap: { ui: BUSY(v), event: "search" },
       }],
     },
     ...(results === null
-      ? [{ type: "emptyState", key: "hint", icon: "search", title: "Busca un libro", titleEn: "Find a book", text: "Solo salen los que tienen EPUB o Kindle.", textEn: "Only books with an EPUB or Kindle file show up." }]
+      ? [empty("hint", "search", "Busca un libro", "Find a book", "Solo salen los que tienen EPUB o Kindle.", "Only books with an EPUB or Kindle file show up.")]
       : results.length === 0
-        ? [{ type: "emptyState", key: "none", icon: "search", title: "Sin resultados", titleEn: "No results", text: "Prueba con otra palabra.", textEn: "Try another word." }]
-        : results.map((r) => tile(s.v | 0, "ia" + r.id, r.title, r.author, "bookmark", "openIa", r.id))),
+        ? [empty("none", "search", "Sin resultados", "No results", "Prueba con otra palabra.", "Try another word.")]
+        : results.map((r) => tile(s, "ia:" + r.id, r.title, r.author))),
   ];
 }
 
+/** Files on this device: pick books with Kino's picker, list them, a tap reads one. Nothing is uploaded; the book stays where it is. */
+function filesTab(s) {
+  const list = Array.isArray(s.fileList) ? s.fileList : [];
+  const pick = {
+    type: "Column", key: "pickBox", padding: 16, gap: 8,
+    children: [
+      { type: "button", key: "pickBtn", label: "Elegir libros de este aparato", labelEn: "Pick books from this device", variant: "primary", onTap: "pickBook" },
+      { type: "text", key: "pickHint", text: "Libros .epub y .mobi que ya tienes en tu aparato. No se sube nada: se leen desde donde están.", textEn: "Books (.epub, .mobi) you already have on your device. Nothing is uploaded: they are read where they are.", style: "caption", color: "muted" },
+    ],
+  };
+  if (list.length === 0) return [pick, empty("nofiles", "bookmark", "Aún no has elegido ningún libro", "No book picked yet", "Toca el botón de arriba y elige uno o varios.", "Tap the button above and pick one or several.")];
+  return [pick, ...list.map((f) => tile(s, "lf:" + f.id, f.name.replace(/\.[A-Za-z0-9]{2,5}$/, ""), `${(f.size / 1e6).toFixed(1)} MB · ${f.name.slice(f.name.lastIndexOf(".") + 1).toUpperCase()}`, "fileMenu"))];
+}
+
+/** My library: a filter (all, favourites, or one category) over the books the person has opened. */
 function mineTab(s, mine) {
-  const read = BOOKS.filter((b) => s.pos && s.pos["gb:" + b.id]).map((b) => tile(s.v | 0, "mg" + b.id, b.title, b.author, "check", "openGb", b.id));
-  const rows = [...read, ...mine.map((m) => tile(s.v | 0, "mi" + m.id, m.title, "archive.org", "bookmark", "openIa", m.id))];
-  return rows.length ? rows : [{ type: "emptyState", key: "nomine", icon: "bookmark", title: "Aún no has leído nada", titleEn: "Nothing read yet", text: "Los libros que abras quedan aquí, en la página donde los dejaste.", textEn: "Books you open stay here, on the page you left them." }];
+  const used = [...new Set(mine.map((m) => m.cat).filter(Boolean))].slice(0, MAX_CATS);
+  const filter = s.filter === "fav" || used.includes(s.filter) ? s.filter : "all";
+  const shown = mine.filter((m) => (filter === "all" ? true : filter === "fav" ? m.fav : m.cat === filter));
+  const chips = {
+    type: "Column", key: "mineBox", padding: 16,
+    children: [{
+      type: "Chips", key: "lf", value: filter, onChanged: "libFilter",
+      options: [{ value: "all", label: `Todos (${mine.length})`, labelEn: `All (${mine.length})` }, { value: "fav", label: "Favoritos", labelEn: "Favourites" }, ...used.map((c) => ({ value: c, label: c }))],
+    }],
+  };
+  if (mine.length === 0) return [empty("nomine", "bookmark", "Tu biblioteca está vacía", "Your library is empty", "Los libros que abras quedan aquí, en la página donde los dejaste. Mantén pulsado uno para marcarlo como favorito, ponerle categoría o borrarlo.", "Books you open stay here, on the page you left them. Press and hold one to make it a favourite, give it a category or delete it.")];
+  return [
+    chips,
+    ...(shown.length === 0 ? [empty("nofilter", "search", "Ningún libro aquí", "No book here", "Cambia el filtro o marca algún libro.", "Change the filter or mark a book.")] : []),
+    ...shown.map((m) => {
+      const pct = m.n > 1 ? Math.round(((s.places && s.places[m.key]) || 0) / (m.n - 1) * 100) : 0;
+      const bits = [m.fav ? "★" : "", m.cat, `${pct} %`, m.key.startsWith("gb:") ? "Gutenberg" : "archive.org"].filter(Boolean);
+      return tile(s, m.key, m.title, bits.join(" · "), true);
+    }),
+  ];
 }
 
 function library(s, mine) {
   const tab = TABS.includes(s.tab) ? s.tab : "gutenberg";
-  const rows = tab === "gutenberg" ? gutenbergTab(s) : tab === "archive" ? archiveTab(s) : mineTab(s, mine);
+  const rows = tab === "gutenberg" ? gutenbergTab(s) : tab === "archive" ? archiveTab(s) : tab === "files" ? filesTab(s) : mineTab(s, mine);
+  const v = s.v | 0;
   const notes = [];
   if (s.error) {
     notes.push({
-      type: "MaterialBanner", key: "err", role: s.resume ? "info" : "error", text: s.error, textEn: s.error,
-      action: s.resume ? { label: "Cancelar", labelEn: "Cancel", onTap: "cancel" } : undefined,
+      type: "MaterialBanner", key: "err", role: "error", text: s.error, textEn: s.error,
+    });
+  }
+  if (s.prep) {
+    const text = s.prep.text || `Preparando «${s.prep.title}»… ${s.prep.pct | 0} %`;
+    notes.push({ type: "MaterialBanner", key: "prep", role: "info", text, textEn: text, action: { label: "Cancelar", labelEn: "Cancel", onTap: "cancel" } });
+  }
+  const drop = s.askDrop && mine.find((m) => m.key === s.askDrop);
+  if (drop) {
+    notes.push({
+      type: "MaterialBanner", key: "drop", role: "warning", text: `¿Borrar «${drop.title}» de tu biblioteca, con sus notas y marcadores?`, textEn: `Delete «${drop.title}» from your library, with its notes and bookmarks?`,
+      action: { label: "Borrar", labelEn: "Delete", onTap: { event: "dropYes", arg: drop.key } },
     });
   }
   return {
     type: "Scaffold",
-    every: s.resume ? { ms: 1500, event: "resume" } : undefined,
+    every: s.prep ? { ms: 400, event: "prep" } : undefined,
     appBar: {
       type: "AppBar", key: "barLib", mergeWithKinoBar: true, dense: true,
       leading: { type: "IconButton", key: "closeLib", icon: "close", labelText: "Cerrar", labelTextEn: "Close", onPressed: { close: true } },
@@ -872,29 +1320,35 @@ function library(s, mine) {
         type: "TabBar", key: "tabs", value: tab, onChanged: "tab", tabs: [
           { value: "gutenberg", label: "Gutenberg", labelEn: "Gutenberg" },
           { value: "archive", label: "archive.org", labelEn: "archive.org" },
-          { value: "mine", label: "Mis libros", labelEn: "My books" },
+          ...(hasFiles() ? [{ value: "files", label: "Mis archivos", labelEn: "My files" }] : []),
+          { value: "mine", label: "Mi biblioteca", labelEn: "My library" },
         ],
       },
     },
     body: {
       type: "SingleChildScrollView", key: "libScroll",
-      children: [{ type: "Column", key: "libCol", children: [...notes, skeleton(s.v | 0), { type: "Column", key: "content" + (s.v | 0), children: rows }] }],
+      children: [{ type: "Column", key: "libCol", children: [...notes, skeleton(v), { type: "Column", key: "content" + v, children: rows }] }],
     },
   };
 }
 
-const SIZES = ["p", "h4", "h3"];
-const fontOf = (s) => clamp(Number.isInteger(s.fs) ? s.fs : 0, 0, SIZES.length - 1);
+/** The place a page starts and where the next one does (Infinity for the last): the paragraphs a page holds. */
+const spanOf = (starts, page) => [starts[page], page < starts.length - 1 ? starts[page + 1] : Infinity];
 
-function reader(s, pages) {
+/** The book on show: its page, the slider, the arrows, the text size, and the bar with the mark, the note, the book's menu and the contents. */
+function reader(s, book, marks, notes) {
+  const { pages, starts } = book;
   const last = pages.length - 1;
-  const page = clamp(s.page | 0, 0, last);
+  const page = pageOf(starts, s.p | 0);
+  const [from, to] = spanOf(starts, page);
+  const marked = marks.some((m) => m.p >= from && m.p < to);
+  const noted = notes.some((m) => m.p >= from && m.p < to);
   const blocks = pages[page].split("\n\n").map((p, i) =>
     p[0] === HEADING
       ? { type: "text", key: "para" + i, text: p.slice(1), textEn: p.slice(1), style: "h2" }
       : { type: "text", key: "para" + i, text: p, textEn: p, style: SIZES[fontOf(s)] });
   const pct = last > 0 ? Math.round((page / last) * 100) : 100;
-  const step = (key, icon, label, labelEn, arg, off) => ({ type: "IconButton", key, icon, labelText: label, labelTextEn: labelEn, onPressed: { event: "nav", arg }, enabled: !off });
+  const btn = (key, icon, label, labelEn, onPressed, off) => ({ type: "IconButton", key, icon, labelText: label, labelTextEn: labelEn, onPressed, enabled: !off });
   return {
     type: "Scaffold",
     onBack: "lib",
@@ -903,13 +1357,14 @@ function reader(s, pages) {
       title: s.title || "Libro", titleEn: s.title || "Book",
       leading: { type: "IconButton", key: "backRead", icon: "arrow_back", labelText: "Biblioteca", labelTextEn: "Library", onPressed: "lib" },
       actions: [
-        { type: "IconButton", key: "fontDown", icon: "remove", labelText: "Letra más pequeña", labelTextEn: "Smaller text", onPressed: { event: "font", arg: "-1" }, enabled: fontOf(s) > 0 },
-        { type: "IconButton", key: "fontUp", icon: "add", labelText: "Letra más grande", labelTextEn: "Larger text", onPressed: { event: "font", arg: "1" }, enabled: fontOf(s) < SIZES.length - 1 },
-        { type: "IconButton", key: "toStart", icon: "home", labelText: "Al inicio", labelTextEn: "To the start", onPressed: { event: "nav", arg: "0" } },
+        { type: "IconButton", key: "mark", icon: "bookmark", selected: marked, labelText: marked ? "Quitar el marcador" : "Poner un marcador", labelTextEn: marked ? "Remove the bookmark" : "Add a bookmark", onPressed: "mark" },
+        { type: "IconButton", key: "note", icon: "edit", selected: noted, labelText: noted ? "Editar la nota de esta página" : "Escribir una nota en esta página", labelTextEn: noted ? "Edit this page's note" : "Write a note on this page", onPressed: "noteOpen" },
+        { type: "IconButton", key: "bookMenuBtn", icon: "more_vert", labelText: "Favorito y categoría", labelTextEn: "Favourite and category", onPressed: { event: "bookMenu", arg: s.key } },
+        { type: "IconButton", key: "toc", icon: "list", labelText: "Contenido, marcadores, notas y búsqueda", labelTextEn: "Contents, bookmarks, notes and search", onPressed: "toc" },
       ],
     },
     body: {
-      type: "Column", key: "readBody", fill: true,
+      type: "Column", key: "readBody", fill: true, onSwipeLeft: { event: "nav", arg: "next" }, onSwipeRight: { event: "nav", arg: "prev" },
       children: [
         {
           type: "SingleChildScrollView", key: "text" + page, flex: 1, zoom: true,
@@ -923,10 +1378,12 @@ function reader(s, pages) {
               labelText: `Página ${page + 1} de ${pages.length} · ${pct} %`, labelTextEn: `Page ${page + 1} of ${pages.length} · ${pct} %`,
             }] : []),
             {
-              type: "Row", key: "steps", mainAxisAlignment: "center", gap: 24,
+              type: "Row", key: "steps", mainAxisAlignment: "center", gap: 16,
               children: [
-                step("prev", "arrow_back", "Página anterior", "Previous page", "prev", page === 0),
-                step("next", "arrow_forward", "Página siguiente", "Next page", "next", page === last),
+                btn("fontDown", "remove", "Letra más pequeña", "Smaller text", { event: "font", arg: "-1" }, fontOf(s) === 0),
+                btn("prev", "arrow_back", "Página anterior", "Previous page", { event: "nav", arg: "prev" }, page === 0),
+                btn("next", "arrow_forward", "Página siguiente", "Next page", { event: "nav", arg: "next" }, page === last),
+                btn("fontUp", "add", "Letra más grande", "Larger text", { event: "font", arg: "1" }, fontOf(s) === SIZES.length - 1),
               ],
             },
           ],
@@ -936,24 +1393,162 @@ function reader(s, pages) {
   };
 }
 
-export async function screen({ state }) {
-  const s = state && typeof state === "object" ? state : {};
-  if (s.view === "read" && s.key) {
-    try { return reader(s, await pagesOf(s.key, s.title)); } catch (e) { return library({ ...s, view: "lib", error: message(e) }, await shelf()); }
+/** Contents, bookmarks, notes and search of the book on show. */
+function contents(s, book, paras, marks, notes) {
+  const tab = TOC_TABS.includes(s.tocTab) ? s.tocTab : "chapters";
+  const { starts } = book;
+  const pageNo = (p) => `Página ${pageOf(starts, p) + 1} de ${starts.length}`;
+  const pageNoEn = (p) => `Page ${pageOf(starts, p) + 1} of ${starts.length}`;
+  const row = (key, title, p, onLongPress) => ({
+    type: "ListTile", key, title, titleEn: title, subtitle: pageNo(p), subtitleEn: pageNoEn(p), dense: true,
+    onTap: { event: "goP", arg: String(p) }, ...(onLongPress ? { onLongPress } : {}),
+  });
+  const hint = (key, es, en) => ({ type: "text", key, text: es, textEn: en, style: "caption", color: "muted", padding: 16 });
+  let rows;
+  if (tab === "chapters") {
+    const ch = chaptersOf(paras);
+    rows = ch.length ? ch.map((c, i) => row("ch" + i, c.t, c.p)) : [empty("noch", "list", "Este libro no marca capítulos", "This book marks no chapters", "Usa el deslizador o la búsqueda para moverte.", "Use the slider or the search to move around.")];
+  } else if (tab === "marks") {
+    rows = marks.length
+      ? [hint("markHint", "Mantén pulsado un marcador para borrarlo.", "Press and hold a bookmark to delete it."), ...marks.map((m) => row("bm" + m.p, m.t || "Marcador", m.p, { event: "markDel", arg: String(m.p) }))]
+      : [empty("nomark", "bookmark", "Sin marcadores", "No bookmarks", "Toca el marcador de la barra para guardar la página donde estás.", "Tap the bookmark in the bar to keep the page you are on.")];
+  } else if (tab === "notes") {
+    rows = notes.length
+      ? [hint("noteHint", "Toca una nota para ir a su página. Mantén pulsada una para borrarla.", "Tap a note to go to its page. Press and hold one to delete it."), ...notes.map((m) => row("nt" + m.p, m.t, m.p, { event: "noteDel", arg: String(m.p) }))]
+      : [empty("nonote", "edit", "Sin notas", "No notes", "Toca el lápiz de la barra para escribir una nota en la página donde estás.", "Tap the pencil in the bar to write a note on the page you are on.")];
+  } else {
+    const found = Array.isArray(s.found) ? s.found : null;
+    rows = [
+      {
+        type: "Column", key: "findBox", padding: 16,
+        children: [{
+          type: "TextField", key: "fq", kind: "search", labelText: "Buscar en este libro", labelTextEn: "Search this book",
+          hintText: "Una palabra o una frase", hintTextEn: "A word or a phrase", onSubmitted: "find",
+          trailingIcon: "search", trailingLabel: "Buscar", trailingLabelEn: "Search", onTrailingTap: "find",
+        }],
+      },
+      ...(found === null ? [] : found.length === 0
+        ? [empty("nofind", "search", "No aparece", "Not found", "Prueba con otra palabra (mínimo tres letras).", "Try another word (at least three letters).")]
+        : found.map((f, i) => row("f" + i, f.t, f.p))),
+    ];
   }
-  return library(s, await shelf());
+  return {
+    type: "Scaffold",
+    onBack: "closeToc",
+    appBar: {
+      type: "AppBar", key: "barToc", mergeWithKinoBar: true, dense: true,
+      leading: { type: "IconButton", key: "backToc", icon: "arrow_back", labelText: "Volver al libro", labelTextEn: "Back to the book", onPressed: "closeToc" },
+      title: {
+        type: "TabBar", key: "tocTabs", value: tab, onChanged: "tocTab", tabs: [
+          { value: "chapters", label: "Capítulos", labelEn: "Chapters" },
+          { value: "marks", label: "Marcadores", labelEn: "Bookmarks" },
+          { value: "notes", label: "Notas", labelEn: "Notes" },
+          { value: "find", label: "Buscar", labelEn: "Search" },
+        ],
+      },
+    },
+    body: { type: "SingleChildScrollView", key: "tocScroll", children: [{ type: "Column", key: "tocCol" + tab, children: rows }] },
+  };
 }
 
-/** Opens book [key]: its pages (downloaded now if need be) and the page the person was on. A half download goes on by itself. */
-async function open(s, key, title, ev, arg) {
+/** The note of the page on show: one box, Save and Delete. */
+function noteScreen(s, book, notes) {
+  const { starts } = book;
+  const page = pageOf(starts, s.p | 0);
+  const [from, to] = spanOf(starts, page);
+  const mine = notes.find((m) => m.p >= from && m.p < to);
+  const pageNo = `Página ${page + 1} de ${starts.length}`;
+  return {
+    type: "Scaffold",
+    onBack: "closeNote",
+    appBar: {
+      type: "AppBar", key: "barNote", mergeWithKinoBar: true, dense: true, title: "Nota", titleEn: "Note",
+      leading: { type: "IconButton", key: "backNote", icon: "arrow_back", labelText: "Volver al libro", labelTextEn: "Back to the book", onPressed: "closeNote" },
+    },
+    body: {
+      type: "SingleChildScrollView", key: "noteScroll",
+      children: [{
+        type: "Column", key: "noteCol", padding: 16, gap: 12,
+        children: [
+          { type: "text", key: "noteWhere", text: `${s.title || ""} · ${pageNo}`, textEn: `${s.title || ""} · Page ${page + 1} of ${starts.length}`, style: "caption", color: "muted" },
+          { type: "TextField", key: "nt", labelText: "Tu nota", labelTextEn: "Your note", multiline: true, maxLength: NOTE_CHARS, value: mine ? mine.t : "" },
+          { type: "button", key: "noteSave", label: "Guardar la nota", labelEn: "Save the note", variant: "primary", onTap: "noteSave" },
+          ...(mine ? [{ type: "button", key: "noteDelete", label: "Borrar la nota", labelEn: "Delete the note", variant: "text", onTap: { event: "noteDel", arg: String(mine.p) } }] : []),
+        ],
+      }],
+    },
+  };
+}
+
+/** A new category: one box, then it is given to the book. */
+function categoryScreen(s) {
+  return {
+    type: "Scaffold",
+    onBack: "catBack",
+    appBar: {
+      type: "AppBar", key: "barCat", mergeWithKinoBar: true, dense: true, title: "Nueva categoría", titleEn: "New category",
+      leading: { type: "IconButton", key: "backCat", icon: "arrow_back", labelText: "Volver", labelTextEn: "Back", onPressed: "catBack" },
+    },
+    body: {
+      type: "Column", key: "catCol", padding: 16, gap: 12,
+      children: [
+        { type: "TextField", key: "cn", labelText: "Nombre de la categoría", labelTextEn: "Category name", maxLength: 24, onSubmitted: "catSave" },
+        { type: "button", key: "catSave", label: "Guardar y usar", labelEn: "Save and use", variant: "primary", onTap: "catSave" },
+      ],
+    },
+  };
+}
+
+export async function screen({ state }) {
+  const s = state && typeof state === "object" ? state : {};
+  if (s.view === "category" && s.target) return categoryScreen(s);
+  if ((s.view === "read" || s.view === "toc" || s.view === "note") && s.key) {
+    try {
+      const { paras } = await parasNow(s.key);
+      const book = pagesFor(paras, fontOf(s));
+      if (s.view === "toc") return contents(s, book, paras, await marksOf(s.key), await notesOf(s.key));
+      if (s.view === "note") return noteScreen(s, book, await notesOf(s.key));
+      return reader(s, book, await marksOf(s.key), await notesOf(s.key));
+    } catch (e) { return library({ ...s, view: "lib", error: message(e) }, await shelf()); }
+  }
+  const mine = await shelf();
+  let fileList = [];
+  if (s.tab === "files" && hasFiles()) { try { fileList = await kino.files.list({ kinds: ["book"] }); } catch { fileList = []; } }
+  const covers = {};
+  const places = {};
+  const keys = [...(s.gb && s.gb.items ? s.gb.items.map((b) => "gb:" + b.id) : []), ...(Array.isArray(s.results) ? s.results : []).map((r) => "ia:" + r.id), ...mine.map((m) => m.key)];
+  for (const k of keys) { const c = await kino.storage.get(coverKey(k)); if (typeof c === "string" && c) covers[k] = c; }
+  for (const m of mine) places[m.key] = await placeOf(m.key);
+  return library({ ...s, covers, places, fileList }, mine);
+}
+
+/** The keys older versions of this plugin kept (a book as one big value, a shelf and places of another shape) are dropped once. */
+async function purgeOld() {
+  for (const k of kino.storage.keys()) if (k === "shelf3" || k.startsWith("book3:") || k.startsWith("pos:")) await kino.storage.remove(k);
+}
+
+/** Opens book [key]: its text (got ready a step at a time, with a timer asking for the next step) and the place the person was at. */
+async function openBook(s, key, title) {
   try {
-    const pages = await pagesOf(key, title);
-    const saved = Number(await kino.storage.get(posKey(key))) || 0;
-    return { state: { ...s, view: "read", key, title, page: clamp(saved, 0, pages.length - 1), fs: fontOf({ fs: Number(await kino.storage.get("fs")) || 0 }), pos: { ...(s.pos || {}), [key]: true }, error: "", resume: null } };
+    const got = (await parasOf(key)) || (await prepare(key));
+    if (!got.paras) return { state: { ...s, view: "lib", error: "", prep: { key, title, pct: got.pct } } };
+    await touchLibrary(key, title, got.paras.length, got.size);
+    const fs = fontOf({ fs: Number(await kino.storage.get("fs")) || 0 });
+    return { state: { ...s, view: "read", key, title, p: clamp(await placeOf(key), 0, got.paras.length - 1), fs, error: "", prep: null, askDrop: "" } };
   } catch (e) {
-    return { state: { ...s, view: "lib", error: message(e), resume: e && e.partial ? { ev, arg } : null } };
+    return { state: { ...s, view: "lib", error: e && e.partial ? "" : message(e), prep: e && e.partial ? { key, title, text: message(e) } : null } };
   }
 }
+
+const titleOf = async (s, key) => {
+  if (key.startsWith("lf:")) {
+    try { return (await kino.files.info(key.slice(3))).name.replace(/\.[A-Za-z0-9]{2,5}$/, ""); } catch { return key; }
+  }
+  const gb = s.gb && s.gb.items ? s.gb.items.find((b) => "gb:" + b.id === key) : null;
+  const ia = (Array.isArray(s.results) ? s.results : []).find((r) => "ia:" + r.id === key);
+  const kept = (await shelf()).find((m) => m.key === key);
+  return (gb && gb.title) || (ia && ia.title) || (kept && kept.title) || key;
+};
 
 export async function screenEvent(ev) {
   const out = await handle(ev);
@@ -961,31 +1556,113 @@ export async function screenEvent(ev) {
   return out;
 }
 
+/** Runs a Gutenberg query and puts what it says in the state's list; a failure is the state's error. */
+async function gbList(s, q, lang, page) {
+  try {
+    const r = await gutenberg(q, lang, page);
+    const items = page > 1 && s.gb && s.gb.items ? [...s.gb.items, ...r.items] : r.items;
+    return { state: { ...s, error: "", gb: { q, lang, items, more: r.more, page } } };
+  } catch (e) {
+    return { state: { ...s, error: message(e), gb: { q, lang, items: s.gb && s.gb.items ? s.gb.items : [], more: false, page: 1 } } };
+  }
+}
+
+/** The menu of a book: favourite, category, the saved text, delete. */
+async function bookMenu(s, key) {
+  const m = (await libraryMap())[key];
+  const items = [];
+  if (m) {
+    items.push({ label: m.fav ? "Quitar de favoritos" : "Marcar como favorito", labelEn: m.fav ? "Remove from favourites" : "Make favourite", icon: "star", onTap: { event: "favToggle", arg: key } });
+    items.push({ label: m.cat ? `Categoría: ${m.cat}` : "Poner categoría", labelEn: m.cat ? `Category: ${m.cat}` : "Set a category", icon: "list", onTap: { event: "catMenu", arg: key } });
+    if (m.cached) items.push({ label: "Quitar el texto descargado", labelEn: "Remove the downloaded text", icon: "download", onTap: { event: "textDrop", arg: key } });
+    items.push({ label: "Borrar de mi biblioteca", labelEn: "Delete from my library", icon: "delete", onTap: { event: "askDrop", arg: key } });
+  }
+  return items.length ? { state: s, menu: { title: m.title.slice(0, 40), items } } : null;
+}
+
 async function handle({ name, arg, value, state }) {
   const s = state && typeof state === "object" ? state : {};
-  if (name === "lib") return { state: { ...s, view: "lib", error: "", resume: null } };
-  if (name === "tab") return { state: { ...s, tab: TABS.includes(value) ? value : "gutenberg", error: "", resume: null } };
-  if (name === "font") {
-    const fs = clamp(fontOf(s) + (Number(arg) || 0), 0, SIZES.length - 1);
-    await kino.storage.set("fs", String(fs));
-    return { state: { ...s, fs } };
+  const inputs = s.inputs || {};
+  if (name === "open") {
+    await purgeOld();
+    return s.gb ? null : gbList(s, "", "es", 1);
   }
-  if (name === "cancel") return { state: { ...s, error: "", resume: null } };
-  if (name === "resume") {
-    return s.resume ? handle({ name: s.resume.ev, arg: s.resume.arg, state: { ...s, resume: null } }) : null;
+  if (name === "lib") return { state: { ...s, view: "lib", error: "" } };
+  if (name === "tab") return { state: { ...s, tab: TABS.includes(value) ? value : "gutenberg", error: "", askDrop: "" } };
+  if (name === "cancel") {
+    if (s.prep) await prepClear(s.prep.key);
+    return { state: { ...s, error: "", prep: null } };
   }
-  if (name === "openGb") {
-    const b = BOOKS.find((x) => x.id === String(arg));
-    return b ? open(s, "gb:" + b.id, b.title, "openGb", b.id) : null;
+  if (name === "prep") return s.prep ? openBook(s, s.prep.key, s.prep.title) : null;
+  if (name === "openBook") {
+    const key = String(arg || "");
+    return BOOK_KEY.test(key) ? openBook(s, key, await titleOf(s, key)) : null;
   }
-  if (name === "openIa") {
-    const id = String(arg || "");
-    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,100}$/.test(id)) return null;
-    const known = (Array.isArray(s.results) ? s.results : []).find((r) => r.id === id) || (await shelf()).find((r) => r.id === id);
-    return open(s, "ia:" + id, known ? known.title : id, "openIa", id);
+  // a book's menu: favourite, category, delete
+  if (name === "bookMenu") return BOOK_KEY.test(String(arg)) ? bookMenu(s, String(arg)) : null;
+  if (name === "favToggle" && BOOK_KEY.test(String(arg))) {
+    const m = (await libraryMap())[String(arg)];
+    if (m) await patchBook(String(arg), { fav: !m.fav });
+    return { state: { ...s } };
   }
+  if (name === "catMenu" && BOOK_KEY.test(String(arg))) {
+    const key = String(arg);
+    const list = await categories();
+    const items = list.slice(0, 6).map((c) => ({ label: c, icon: "list", onTap: { event: "catSet", arg: key + "|" + c } }));
+    if (list.length < MAX_CATS) items.push({ label: "Nueva categoría…", labelEn: "New category…", icon: "add", onTap: { event: "catNew", arg: key } });
+    items.push({ label: "Sin categoría", labelEn: "No category", icon: "remove", onTap: { event: "catSet", arg: key + "|" } });
+    return { state: s, menu: { title: "Categoría", titleEn: "Category", items: items.slice(0, 8) } };
+  }
+  if (name === "catSet") {
+    const [key, cat] = String(arg || "").split("|");
+    if (!BOOK_KEY.test(key)) return null;
+    await patchBook(key, { cat: (cat || "").slice(0, 24) });
+    return { state: { ...s } };
+  }
+  if (name === "catNew") return BOOK_KEY.test(String(arg)) ? { state: { ...s, view: "category", target: String(arg), back: s.view === "read" ? "read" : "lib" } } : null;
+  if (name === "catBack") return { state: { ...s, view: s.back === "read" ? "read" : "lib", target: "" } };
+  if (name === "catSave") {
+    const text = String(value ?? inputs.cn ?? "").replace(/\s+/g, " ").trim().slice(0, 24);
+    if (!text || !s.target) return { state: { ...s, view: s.back === "read" ? "read" : "lib", target: "" } };
+    const list = await categories();
+    if (!list.includes(text) && list.length < MAX_CATS) await kino.storage.set(CATS, JSON.stringify([...list, text]));
+    await patchBook(s.target, { cat: text });
+    return { state: { ...s, view: s.back === "read" ? "read" : "lib", target: "" } };
+  }
+  if (name === "textDrop" && BOOK_KEY.test(String(arg))) { await dropText(String(arg)); return { state: { ...s } }; }
+  if (name === "askDrop") return BOOK_KEY.test(String(arg)) ? { state: { ...s, view: "lib", askDrop: String(arg) } } : null;
+  if (name === "dropYes") {
+    const key = String(arg || "");
+    if (!BOOK_KEY.test(key)) return null;
+    await forget(key);
+    return { state: { ...s, askDrop: "" } };
+  }
+  if (name === "dismiss") return { state: { ...s, askDrop: "" } };
+  // files on this device (kino.files)
+  if (name === "pickBook") {
+    if (!hasFiles()) return { state: { ...s, error: "Tu Kino aún no puede abrir archivos del aparato (llega con la 0.9.82)." } };
+    try {
+      await kino.files.pick({ kinds: ["book"], multiple: true });
+      return { state: { ...s, tab: "files", error: "" } };
+    } catch (e) {
+      return { state: { ...s, error: e && e.code === "unavailable" ? "Este aparato no tiene un selector de archivos." : message(e) } };
+    }
+  }
+  if (name === "fileMenu" && BOOK_KEY.test(String(arg))) {
+    return { state: s, menu: { title: "Archivo", titleEn: "File", items: [{ label: "Quitar de mis archivos (no se borra del aparato)", labelEn: "Remove from my files (it stays on the device)", icon: "delete", onTap: { event: "fileForget", arg: String(arg) } }] } };
+  }
+  if (name === "fileForget" && String(arg).startsWith("lf:")) {
+    try { await kino.files.forget(String(arg).slice(3)); } catch { /* it was already gone */ }
+    return { state: { ...s } };
+  }
+  if (name === "libFilter") return { state: { ...s, filter: String(value || "all") } };
+  // Project Gutenberg's catalogue
+  if (name === "gbSearch") return gbList(s, String(value ?? inputs.gq ?? "").trim(), (s.gb && s.gb.lang) || "es", 1);
+  if (name === "gbLang") return gbList(s, (s.gb && s.gb.q) || "", ["es", "en", "all"].includes(value) ? value : "es", 1);
+  if (name === "gbMore") return s.gb ? gbList(s, s.gb.q || "", s.gb.lang || "es", (s.gb.page | 0) + 1) : null;
+  // archive.org
   if (name === "search") {
-    const q = String(value ?? (s.inputs && s.inputs.q) ?? "").trim();
+    const q = String(value ?? inputs.q ?? "").trim();
     if (q.length < 2) return { state: { ...s, error: "Escribe al menos dos letras para buscar" } };
     try {
       const res = await kino.fetch(searchUrl(q), { timeoutMs: 30000 });
@@ -995,14 +1672,58 @@ async function handle({ name, arg, value, state }) {
       return { state: { ...s, error: message(e) } };
     }
   }
-  if ((name === "nav" || name === "jump") && s.view === "read" && s.key) {
-    const pages = await pagesOf(s.key, s.title);
-    const here = clamp(s.page | 0, 0, pages.length - 1);
+  // reading
+  if (!s.key || (s.view !== "read" && s.view !== "toc" && s.view !== "note")) return null;
+  const { paras } = await parasNow(s.key);
+  const fs = fontOf(s);
+  const book = pagesFor(paras, fs);
+  const moveTo = async (p) => {
+    const at = clamp(Math.round(p), 0, paras.length - 1);
+    await kino.storage.set(posKey(s.key), String(at));
+    return { state: { ...s, view: "read", p: at } };
+  };
+  const pageSpan = () => spanOf(book.starts, pageOf(book.starts, s.p | 0));
+  if (name === "nav" || name === "jump") {
+    const page = pageOf(book.starts, s.p | 0);
     const a = String(arg ?? "");
-    const to = name === "jump" ? Number(value) || 0 : a === "next" ? here + 1 : a === "prev" ? here - 1 : Number(a) || 0;
-    const page = clamp(Math.round(to), 0, pages.length - 1);
-    await kino.storage.set(posKey(s.key), String(page));
-    return { state: { ...s, page } };
+    const to = name === "jump" ? Number(value) || 0 : a === "next" ? page + 1 : a === "prev" ? page - 1 : Number(a) || 0;
+    return moveTo(book.starts[clamp(Math.round(to), 0, book.starts.length - 1)]);
   }
+  if (name === "font") {
+    const next = clamp(fs + (Number(arg) || 0), 0, SIZES.length - 1);
+    await kino.storage.set("fs", String(next));
+    return { state: { ...s, fs: next } };
+  }
+  if (name === "mark") {
+    const [from, to] = pageSpan();
+    const marks = await marksOf(s.key);
+    const kept = marks.filter((m) => m.p < from || m.p >= to);
+    if (kept.length === marks.length) kept.push({ p: from, t: book.pages[pageOf(book.starts, from)].split("\n\n")[0].replace(HEADING, "").slice(0, 70) });
+    await kino.storage.set(bmKey(s.key), JSON.stringify(kept.slice(0, MAX_MARKS)));
+    return { state: { ...s } };
+  }
+  if (name === "markDel") {
+    await kino.storage.set(bmKey(s.key), JSON.stringify((await marksOf(s.key)).filter((m) => m.p !== Number(arg))));
+    return { state: { ...s } };
+  }
+  if (name === "noteOpen") return { state: { ...s, view: "note" } };
+  if (name === "closeNote") return { state: { ...s, view: "read" } };
+  if (name === "noteSave") {
+    const text = String(value ?? inputs.nt ?? "").trim().slice(0, NOTE_CHARS);
+    const [from, to] = pageSpan();
+    const kept = (await notesOf(s.key)).filter((m) => m.p < from || m.p >= to);
+    if (text) kept.push({ p: from, t: text });
+    await kino.storage.set(noteKey(s.key), JSON.stringify(kept.slice(0, MAX_NOTES)));
+    return { state: { ...s, view: "read" } };
+  }
+  if (name === "noteDel") {
+    await kino.storage.set(noteKey(s.key), JSON.stringify((await notesOf(s.key)).filter((m) => m.p !== Number(arg))));
+    return { state: { ...s, view: s.view === "note" ? "read" : s.view } };
+  }
+  if (name === "toc") return { state: { ...s, view: "toc", tocTab: "chapters", found: null } };
+  if (name === "closeToc") return { state: { ...s, view: "read" } };
+  if (name === "tocTab") return { state: { ...s, tocTab: TOC_TABS.includes(value) ? value : "chapters" } };
+  if (name === "find") return { state: { ...s, found: findInBook(paras, String(value ?? inputs.fq ?? "")) } };
+  if (name === "goP") return moveTo(Number(arg) || 0);
   return null;
 }
