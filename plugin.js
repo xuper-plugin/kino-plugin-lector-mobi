@@ -23,7 +23,7 @@ const PAGE_SEP = "\u0002";
 const HEADING = "\u0001";
 /** Whatever the book, never more than this many characters of text are kept (a runaway file cannot fill the storage). */
 const MAX_TEXT = 3_000_000;
-/** The biggest file read: it is downloaded in pieces (kino.fetch answers at most 5 MB at once) and kept as base64 in the 16 MB storage meanwhile. */
+/** The biggest piece of a file kept whole: it is downloaded in pieces (kino.fetch answers at most 5 MB at once) and kept as base64 in the 16 MB storage meanwhile. A MOBI is cut before its pictures; a big EPUB is read by parts. */
 const MAX_FILE = 9_000_000;
 /** One piece of a download. */
 const CHUNK = 1_500_000;
@@ -467,7 +467,7 @@ export function paginate(paras, limit = PAGE_CHARS) {
 /** The archive.org search URL for what the person typed (a title or an author, any language), only items with EPUB or Kindle. */
 export function searchUrl(q) {
   const clean = String(q).replace(/["\\]/g, " ").replace(/\s+/g, " ").trim().slice(0, 100);
-  const query = `(${clean}) AND mediatype:texts AND (format:EPUB OR format:Kindle)`;
+  const query = `(${clean}) AND mediatype:texts AND (format:EPUB OR format:Kindle) AND -access-restricted-item:true`;
   return `${ARCHIVE}/advancedsearch.php?q=${encodeURIComponent(query)}&fl%5B%5D=identifier&fl%5B%5D=title&fl%5B%5D=creator&rows=12&sort%5B%5D=downloads+desc&output=json`;
 }
 
@@ -482,7 +482,7 @@ export function searchResults(json) {
 /** Of an archive.org item's files, the one to read: a plain EPUB first, then a Kindle (.mobi); never an encrypted or a huge one. */
 export function pickFile(meta) {
   const files = meta && Array.isArray(meta.files) ? meta.files : [];
-  const ok = (f) => !/_lcp\./i.test(f.name) && Number(f.size) <= MAX_FILE;
+  const ok = (f) => !/_lcp\./i.test(f.name);
   const epubs = files.filter((f) => f.format === "EPUB" && /\.epub$/i.test(f.name) && !/_lcp\./i.test(f.name));
   // An item with many EPUBs is a collection, not a book: there is no telling which one the person wants.
   if (epubs.length > 3) throw new Error("Este elemento es una colección de muchos libros: prueba con otro resultado");
@@ -490,11 +490,15 @@ export function pickFile(meta) {
   if (epub) return epub;
   const mobi = files.find((f) => f.format === "Kindle" && /\.mobi$/i.test(f.name) && ok(f));
   if (mobi) return mobi;
-  const tooBig = files.find((f) => (f.format === "EPUB" || f.format === "Kindle") && !/_lcp\./i.test(f.name));
-  throw new Error(tooBig ? `El libro pesa ${(Number(tooBig.size) / 1e6).toFixed(1)} MB: es demasiado grande para este lector` : "Este libro no tiene EPUB ni Kindle sin DRM");
+  throw new Error("Este libro no tiene EPUB ni Kindle sin DRM");
 }
 
 const encPath = (name) => name.split("/").map(encodeURIComponent).join("/");
+
+const LOANED = "Este libro es de préstamo en archive.org y no se puede descargar sin una cuenta";
+
+/** Any EPUB bigger than this is read by parts (only its text), not downloaded whole. */
+export const RANGED_MIN = 3_000_000;
 
 /** The bytes of book [key] ("gb:<number>" or "ia:<identifier>"). */
 async function download(key) {
@@ -507,46 +511,81 @@ async function download(key) {
   const meta = await kino.fetch(`${ARCHIVE}/metadata/${encodeURIComponent(id)}`, { timeoutMs: 30000 });
   if (!meta.ok) throw new Error(`No se pudo consultar archive.org (${meta.status})`);
   const file = pickFile(meta.json());
-  return downloadPieces(`${ARCHIVE}/download/${encodeURIComponent(id)}/${encPath(file.name)}`, key);
+  const url = `${ARCHIVE}/download/${encodeURIComponent(id)}/${encPath(file.name)}`;
+  if (/\.mobi$/i.test(file.name)) return downloadPieces(url, key, mobiTextEnd);
+  if (Number(file.size) > RANGED_MIN) return downloadEpubParts(url, key);
+  return downloadPieces(url, key);
+}
+
+/** One Range request: the bytes and the whole file's size. [range] is "a-b" or "-n" (the last n bytes). */
+async function rangeBytes(url, range) {
+  const res = await kino.fetch(url, { headers: { Range: `bytes=${range}` }, timeoutMs: 30000 });
+  if (res.status === 401 || res.status === 403) throw new Error(LOANED);
+  if (res.status !== 206) throw new Error(res.status === 200 ? "archive.org no deja leer este libro por partes" : `No se pudo descargar el libro (${res.status})`);
+  const m = /\/(\d+)\s*$/.exec(res.headers["content-range"] || "");
+  if (!m) throw new Error("archive.org no dijo el tamaño del libro");
+  return { bytes: b64decode(res.base64()), total: Number(m[1]) };
+}
+
+/**
+ * Where a MOBI's text ends: the first byte of the first record after the text records (images, fonts and the index come after),
+ * read from the first piece. A book that is mostly pictures is then downloaded without them.
+ */
+export function mobiTextEnd(head, total) {
+  if (head.length < 100) return total;
+  const magic = String.fromCharCode(head[60], head[61], head[62], head[63], head[64], head[65], head[66], head[67]);
+  if (magic !== "BOOKMOBI" && magic !== "TEXtREAd") return total;
+  const records = u16(head, 76);
+  if (78 + records * 8 > head.length) return total;
+  const r0 = u32(head, 78);
+  if (r0 + 10 > head.length) return total;
+  const textRecords = u16(head, r0 + 8);
+  if (textRecords + 1 >= records) return total;
+  const end = u32(head, 78 + (textRecords + 1) * 8);
+  return end > 0 && end < total ? end : total;
 }
 
 /**
  * A big file in pieces (HTTP Range), each kept in the storage as it arrives, so a tap that runs out of time loses nothing:
- * the next tap goes on from the piece it stopped at. Throws an Error with `partial` set while the file is not complete.
+ * the next try goes on from the piece it stopped at. With [trim] (head bytes, file size → where to stop) only that much is read.
+ * Throws an Error with `partial` set while the file is not complete.
  */
-async function downloadPieces(url, key) {
+async function downloadPieces(url, key, trim) {
   const metaKey = "dl:" + key;
-  let meta = { total: 0, got: 0, n: 0 };
+  let meta = { total: 0, got: 0, n: 0, target: 0 };
   try { meta = { ...meta, ...JSON.parse((await kino.storage.get(metaKey)) || "{}") }; } catch { /* a fresh start */ }
   const started = Date.now();
-  while (meta.total === 0 || meta.got < meta.total) {
+  while (meta.target === 0 || meta.got < meta.target) {
     if (Date.now() - started > DOWNLOAD_BUDGET_MS) {
-      const pct = meta.total ? Math.round((meta.got / meta.total) * 100) : 0;
-      throw Object.assign(new Error(`Descargando… ${pct} % (${(meta.got / 1e6).toFixed(1)} de ${(meta.total / 1e6).toFixed(1)} MB). Toca «Leer» otra vez para continuar.`), { partial: true });
+      const pct = meta.target ? Math.round((meta.got / meta.target) * 100) : 0;
+      throw Object.assign(new Error(`Descargando… ${pct} % (${(meta.got / 1e6).toFixed(1)} de ${(meta.target / 1e6).toFixed(1)} MB). Sigue sola.`), { partial: true });
     }
-    const res = await kino.fetch(url, { headers: { Range: `bytes=${meta.got}-${meta.got + CHUNK - 1}` }, timeoutMs: 30000 });
-    let bytesB64 = res.base64();
+    const last = meta.target ? Math.min(meta.got + CHUNK, meta.target) - 1 : meta.got + CHUNK - 1;
+    const res = await kino.fetch(url, { headers: { Range: `bytes=${meta.got}-${last}` }, timeoutMs: 30000 });
+    const bytesB64 = res.base64();
+    const bytes = b64decode(bytesB64);
     let total;
     if (res.status === 206) {
       const m = /\/(\d+)\s*$/.exec(res.headers["content-range"] || "");
       if (!m) throw new Error("archive.org no dijo el tamaño del libro");
       total = Number(m[1]);
     } else if (res.status === 200 && meta.got === 0) {
-      total = b64decode(bytesB64).length; // the server ignored Range and sent it all
+      total = bytes.length; // the server ignored Range and sent it all
+    } else if (res.status === 401 || res.status === 403) {
+      throw new Error(LOANED);
     } else {
       throw new Error(`No se pudo descargar el libro (${res.status})`);
     }
-    if (total > MAX_FILE) {
+    if (meta.target === 0) meta.target = trim ? Math.max(1, Math.min(total, trim(bytes, total))) : total;
+    if (meta.target > MAX_FILE) {
       await clearPieces(key, meta);
-      throw new Error(`El libro pesa ${(total / 1e6).toFixed(1)} MB: es demasiado grande para este lector (máximo ${(MAX_FILE / 1e6).toFixed(0)} MB)`);
+      throw new Error(`El libro pesa ${(meta.target / 1e6).toFixed(1)} MB: es demasiado grande para este lector (máximo ${(MAX_FILE / 1e6).toFixed(0)} MB)`);
     }
-    const got = meta.got + b64decode(bytesB64).length;
     await kino.storage.set(`part:${key}:${meta.n}`, bytesB64);
-    bytesB64 = "";
-    meta = { total, got, n: meta.n + 1 };
+    meta = { ...meta, total, got: meta.got + bytes.length, n: meta.n + 1 };
     await kino.storage.set(metaKey, JSON.stringify(meta));
   }
-  const all = new Uint8Array(meta.total);
+  const all = new Uint8Array(meta.got);
   let at = 0;
   for (let i = 0; i < meta.n; i++) {
     const piece = b64decode((await kino.storage.get(`part:${key}:${i}`)) || "");
@@ -560,6 +599,176 @@ async function downloadPieces(url, key) {
 async function clearPieces(key, meta) {
   for (let i = 0; i < (meta.n || 0); i++) await kino.storage.remove(`part:${key}:${i}`);
   await kino.storage.remove("dl:" + key);
+}
+
+// ---------------------------------------------------------------- a big EPUB, by parts
+
+/** base64 of bytes. */
+export function b64encode(b) {
+  const parts = [];
+  for (let i = 0; i < b.length; i += 3) {
+    const n = (b[i] << 16) | ((b[i + 1] || 0) << 8) | (b[i + 2] || 0);
+    parts.push(B64[n >> 18] + B64[(n >> 12) & 63] + (i + 1 < b.length ? B64[(n >> 6) & 63] : "=") + (i + 2 < b.length ? B64[n & 63] : "="));
+  }
+  return parts.join("");
+}
+
+/** The entries of a ZIP's central directory bytes: name → { flags, method, csize, usize, off, nlen, xlen, raw }. */
+export function parseCentral(cd, count) {
+  const entries = new Map();
+  let p = 0;
+  for (let i = 0; i < count; i++) {
+    if (p + 46 > cd.length || le32(cd, p) !== 0x02014b50) break;
+    const nlen = le16(cd, p + 28);
+    const xlen = le16(cd, p + 30);
+    const clen = le16(cd, p + 32);
+    entries.set(utf8(cd, p + 46, p + 46 + nlen), {
+      flags: le16(cd, p + 8), method: le16(cd, p + 10), csize: le32(cd, p + 20), usize: le32(cd, p + 24),
+      off: le32(cd, p + 42), nlen, xlen, raw: cd.subarray(p, p + 46 + nlen + xlen + clen),
+    });
+    p += 46 + nlen + xlen + clen;
+  }
+  return entries;
+}
+
+/** A ZIP made of only the given `{ raw, rec }` entries (the central directory bytes and the local record bytes of each). */
+export function buildZip(list) {
+  let size = 22;
+  for (const e of list) size += e.rec.length + e.raw.length;
+  const out = new Uint8Array(size);
+  const offs = [];
+  let o = 0;
+  for (const e of list) { offs.push(o); out.set(e.rec, o); o += e.rec.length; }
+  const cdStart = o;
+  list.forEach((e, i) => {
+    out.set(e.raw, o);
+    out[o + 42] = offs[i] & 255; out[o + 43] = (offs[i] >> 8) & 255; out[o + 44] = (offs[i] >> 16) & 255; out[o + 45] = (offs[i] >>> 24) & 255;
+    o += e.raw.length;
+  });
+  const cdSize = o - cdStart;
+  const eocd = [0x50, 0x4b, 5, 6, 0, 0, 0, 0, list.length & 255, list.length >> 8, list.length & 255, list.length >> 8,
+    cdSize & 255, (cdSize >> 8) & 255, (cdSize >> 16) & 255, (cdSize >>> 24) & 255,
+    cdStart & 255, (cdStart >> 8) & 255, (cdStart >> 16) & 255, (cdStart >>> 24) & 255, 0, 0];
+  out.set(eocd, o);
+  return out;
+}
+
+/** The text of one entry from its local record bytes. */
+function recordText(rec, en) {
+  if (en.flags & 1) throw new Error("Este libro tiene DRM (cifrado) y no se puede leer");
+  const start = 30 + le16(rec, 26) + le16(rec, 28);
+  const data = rec.subarray(start, start + en.csize);
+  if (en.method === 0) return utf8(data);
+  if (en.method === 8) return utf8(inflate(data, en.usize));
+  throw new Error("Método de compresión del EPUB no soportado");
+}
+
+/** The spine's files that are in the ZIP, in reading order, with the book's title. */
+export function epubSpine(opf, base, has) {
+  const items = new Map();
+  for (const m of opf.match(/<item\b[^>]*>/gi) || []) items.set(attr(m, "id"), { href: attr(m, "href"), type: attr(m, "media-type") });
+  const out = [];
+  for (const m of opf.match(/<itemref\b[^>]*>/gi) || []) {
+    const it = items.get(attr(m, "idref"));
+    if (!it || !/x?html/i.test(it.type)) continue;
+    const href = it.href.split("#")[0];
+    const name = has(base + href) ? base + href : has(base + decodePath(href)) ? base + decodePath(href) : "";
+    if (name && !out.includes(name)) out.push(name);
+  }
+  return out;
+}
+
+/**
+ * A big EPUB's text without its pictures: the ZIP's central directory (the last bytes), then only the container, the package
+ * and the spine's XHTML files, in a few Range requests, each file kept in the storage as it arrives. What comes back is a small
+ * ZIP with just those files, which `parseEpub` reads as it would the whole book. Throws an Error with `partial` while it is not done.
+ */
+async function downloadEpubParts(url, key) {
+  const started = Date.now();
+  const zk = (n) => `zr:${key}:${n}`;
+  let kept = [];
+  try { kept = JSON.parse((await kino.storage.get("zn:" + key)) || "[]"); } catch { /* a fresh start */ }
+  let central = null;
+  try { central = JSON.parse((await kino.storage.get("zc:" + key)) || "null"); } catch { /* a fresh start */ }
+  if (!central) {
+    const tail = await rangeBytes(url, "-65536");
+    const b = tail.bytes;
+    let e = -1;
+    for (let i = b.length - 22; i >= 0; i--) if (b[i] === 0x50 && b[i + 1] === 0x4b && b[i + 2] === 5 && b[i + 3] === 6) { e = i; break; }
+    if (e < 0) throw new Error("No es un archivo EPUB (ZIP)");
+    const count = le16(b, e + 10);
+    const cdSize = le32(b, e + 12);
+    const cdOff = le32(b, e + 16);
+    if (cdOff === 0xffffffff || count === 0xffff) throw new Error("Este EPUB es demasiado grande para este lector");
+    const base = tail.total - b.length;
+    const cd = cdOff >= base ? b.subarray(cdOff - base, cdOff - base + cdSize) : (await rangeBytes(url, `${cdOff}-${cdOff + cdSize - 1}`)).bytes;
+    central = { count, total: tail.total, cd: b64encode(cd) };
+    await kino.storage.set("zc:" + key, JSON.stringify(central));
+  }
+  const zip = parseCentral(b64decode(central.cd), central.count);
+  const have = (n) => zip.has(n);
+
+  /** Fetches the entries of [names] not kept yet, nearby ones in one request, and keeps each. */
+  const fetchMissing = async (names) => {
+    const todo = names.filter((n) => zip.has(n) && !kept.includes(n)).sort((a, b) => zip.get(a).off - zip.get(b).off);
+    let at = 0;
+    while (at < todo.length) {
+      if (Date.now() - started > DOWNLOAD_BUDGET_MS) {
+        throw Object.assign(new Error(`Descargando el texto… ${kept.length} de ${kept.length + todo.length - at} partes. Sigue sola.`), { partial: true });
+      }
+      const slack = 512;
+      const first = zip.get(todo[at]);
+      let upto = at;
+      let end = first.off + 30 + first.nlen + first.xlen + first.csize + slack;
+      while (upto + 1 < todo.length) {
+        const nx = zip.get(todo[upto + 1]);
+        const nend = nx.off + 30 + nx.nlen + nx.xlen + nx.csize + slack;
+        if (nx.off - end > 120_000 || nend - first.off > CHUNK) break;
+        end = nend;
+        upto++;
+      }
+      if (end - first.off > 1_900_000) throw new Error("Un capítulo es demasiado grande");
+      const got = await rangeBytes(url, `${first.off}-${Math.min(end, central.total || end) - 1}`);
+      for (let i = at; i <= upto; i++) {
+        const en = zip.get(todo[i]);
+        const p = en.off - first.off;
+        let rec = got.bytes.subarray(p, p + 30 + le16(got.bytes, p + 26) + le16(got.bytes, p + 28) + en.csize);
+        if (rec.length < 30 || rec.length < 30 + le16(rec, 26) + le16(rec, 28) + en.csize) {
+          rec = (await rangeBytes(url, `${en.off}-${en.off + 30 + en.nlen + 4096 + en.csize - 1}`)).bytes; // an unusually long local header
+          rec = rec.subarray(0, 30 + le16(rec, 26) + le16(rec, 28) + en.csize);
+        }
+        await kino.storage.set(zk(todo[i]), b64encode(rec));
+        kept.push(todo[i]);
+      }
+      await kino.storage.set("zn:" + key, JSON.stringify(kept));
+      at = upto + 1;
+    }
+  };
+  const record = async (name) => b64decode((await kino.storage.get(zk(name))) || "");
+
+  const first = ["META-INF/container.xml", "META-INF/encryption.xml"].filter(have);
+  await fetchMissing(first);
+  const container = have("META-INF/container.xml") ? recordText(await record("META-INF/container.xml"), zip.get("META-INF/container.xml")) : "";
+  const rootPath = attr((/<rootfile\b[^>]*>/i.exec(container) || [""])[0], "full-path");
+  if (!rootPath || !have(rootPath)) throw new Error("EPUB sin contenido (falta el paquete)");
+  await fetchMissing([rootPath]);
+  const spine = [];
+  let size = 0;
+  for (const n of epubSpine(recordText(await record(rootPath), zip.get(rootPath)), dirOf(rootPath), have)) {
+    spine.push(n);
+    size += zip.get(n).usize;
+    if (size >= MAX_TEXT) break;
+  }
+  await fetchMissing(spine);
+
+  const names = [...first, rootPath, ...spine];
+  const list = [];
+  for (const n of names) list.push({ raw: zip.get(n).raw, rec: await record(n) });
+  const out = buildZip(list);
+  for (const n of kept) await kino.storage.remove(zk(n));
+  await kino.storage.remove("zn:" + key);
+  await kino.storage.remove("zc:" + key);
+  return out;
 }
 
 // ---------------------------------------------------------------- the library (download, keep, read)
