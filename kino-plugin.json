@@ -1,0 +1,24 @@
+{
+  "id": "lector-mobi",
+  "name": "Lector de libros",
+  "version": "1.0.0",
+  "apiVersion": 19,
+  "entry": "plugin.js",
+  "description": "Lee libros .mobi y .epub sin DRM dentro de Kino: busca en Project Gutenberg y archive.org, con portadas, tamaño de letra y marcador de página",
+  "author": "xuper-plugin",
+  "hosts": [
+    "www.gutenberg.org",
+    "archive.org",
+    "*.archive.org"
+  ],
+  "capabilities": [
+    "screen",
+    "storageLarge"
+  ],
+  "screen": {
+    "label": "Lector de libros",
+    "labelEn": "Book reader",
+    "icon": "bookmark",
+    "menuOpens": "screen"
+  }
+}
